@@ -1,4 +1,4 @@
-/* ESP32 DevKit V1 + ST25R3916 (SPI) + SSD1306 128x64 (I2C).
+/* ESP32 DevKit V1 + ST25R3916 (SPI) + SSD1315 128x64 (I2C).
  * Read-only MIFARE Classic 1K dump in RAM; listen mode advertises the saved
  * ISO14443-A UID only. Crypto1 software is in ClassicCrypto1.h but the
  * hardware transport for encrypted parity is NOT implemented yet.
@@ -6,8 +6,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
 #include "ClassicCrypto1.h"
 #include <rfal_mf1.h>
 #include <rfal_nfc.h>
@@ -19,7 +18,9 @@ namespace {
 constexpr int PIN_SCK = 18, PIN_MISO = 19, PIN_MOSI = 23;
 constexpr int PIN_CS = 5, PIN_IRQ = 4;
 constexpr int PIN_SDA = 21, PIN_SCL = 22;
-constexpr int PIN_READ = 32, PIN_LISTEN = 33; // active low, internal pullups
+// Default for four independent buttons. Change to match YOUR module pinout.
+constexpr int PIN_READ = 32, PIN_LISTEN = 33;
+constexpr int PIN_PREV = 25, PIN_NEXT = 26; // active low, internal pullups
 constexpr uint8_t OLED_ADDR = 0x3C;
 constexpr uint8_t SECTORS = 16, BLOCKS = 64, BLOCK_SIZE = 16;
 constexpr uint8_t DEFAULT_KEY[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -42,7 +43,7 @@ SPIClass spi(VSPI);
 RfalRfST25R3916Class reader(&spi, PIN_CS, PIN_IRQ);
 RfalNfcClass nfc(&reader);
 RfalMf1Class mf1(&reader);
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
+U8G2_SSD1315_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
 bool oledOK = false, nfcOK = false;
 rfalNfcDiscoverParam discover = {};
 // Buffers passed to RFAL must outlive rfalListenStart(). Length is in bits.
@@ -68,18 +69,37 @@ struct Button {
   }
 };
 Button readButton{PIN_READ}, listenButton{PIN_LISTEN};
+Button prevButton{PIN_PREV}, nextButton{PIN_NEXT};
+uint8_t selectedBlock = 0;
 
 void screen(const char *a, const char *b = "", const char *c = "", const char *d = "") {
   Serial.printf("%s | %s | %s | %s\n", a, b, c, d);
   if (!oledOK) return;
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println(a); display.println();
-  display.println(b); display.println(c); display.println(d);
-  display.display();
+  display.clearBuffer();
+  display.drawStr(0, 10, a);
+  display.drawStr(0, 26, b);
+  display.drawStr(0, 39, c);
+  display.drawStr(0, 52, d);
+  display.sendBuffer();
 }
 void uidText(char *out, size_t n) {
   snprintf(out, n, "%02X:%02X:%02X:%02X", card.uid[0], card.uid[1], card.uid[2], card.uid[3]);
+}
+void showBlock() {
+  if (!card.hasUid) return;
+  char title[24], first[17], second[17];
+  snprintf(title, sizeof(title), "Block %02u/63 %s", selectedBlock,
+           card.valid[selectedBlock] ? "OK" : "unread");
+  if (card.valid[selectedBlock]) {
+    for (uint8_t i = 0; i < 8; ++i) {
+      snprintf(first + 2 * i, 3, "%02X", card.blocks[selectedBlock][i]);
+      snprintf(second + 2 * i, 3, "%02X", card.blocks[selectedBlock][i + 8]);
+    }
+  } else {
+    strcpy(first, "No block data");
+    second[0] = '\0';
+  }
+  screen(title, first, second, "25=prev  26=next");
 }
 void stopPoll() {
   if (nfc.rfalNfcGetState() > RFAL_NFC_STATE_IDLE) nfc.rfalNfcDeactivate(false);
@@ -97,7 +117,7 @@ void startRead() {
     screen("Poll failed", "See Serial");
     Serial.printf("rfalNfcDiscover: %d\n", (int)rc);
   } else {
-    screen("READ Classic 1K", "Present 4-byte UID", "Default Key A: FF*6", "32=read 33=UID only");
+    screen("READ Classic 1K", "Present 4-byte UID", "Default Key A: FF*6", "32=read 33=listen");
   }
 }
 void startListen() {
@@ -130,8 +150,15 @@ void startListen() {
 // Returns false if a mode button was pressed during a blocking dump.
 bool checkButtons() {
   bool r = readButton.pressed(), l = listenButton.pressed();
+  bool prev = prevButton.pressed(), next = nextButton.pressed();
   if (l) { startListen(); return false; }
   if (r) { startRead(); return false; }
+  // Browsing is deliberately disabled during NFC operations (no OLED I2C
+  // traffic in the response path). It is only available after a read.
+  if (mode == Mode::Idle && card.hasUid && (prev || next)) {
+    selectedBlock = (selectedBlock + (next ? 1U : 63U)) % BLOCKS;
+    showBlock();
+  }
   return true;
 }
 
@@ -159,6 +186,7 @@ void dumpCard(rfalNfcDevice *first) {
     screen("Not Classic 1K", "Need 4-byte UID", "and SAK 08");
     stopPoll(); mode = Mode::Idle; return;
   }
+  selectedBlock = 0;
   // Invalidate the old snapshot before any new attempt. A partial dump is
   // visible on Serial but cannot silently masquerade as a complete dump.
   memset(&card, 0, sizeof(card));
@@ -219,7 +247,7 @@ void dumpCard(rfalNfcDevice *first) {
   stopPoll(); mode = Mode::Idle;
   char count[24]; snprintf(count, sizeof(count), "%u/64 blocks in RAM", good);
   screen(good == BLOCKS ? "READ finished" : "PARTIAL READ", uid, count,
-         "33=UID only 32=retry");
+         "25/26 browse blocks");
   Serial.println("RAM is volatile. Trailer keys are not recovered. UID-only listen is NOT Classic emulation.");
 }
 } // namespace
@@ -228,11 +256,21 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_READ, INPUT_PULLUP);
   pinMode(PIN_LISTEN, INPUT_PULLUP);
+  pinMode(PIN_PREV, INPUT_PULLUP);
+  pinMode(PIN_NEXT, INPUT_PULLUP);
   pinMode(PIN_CS, OUTPUT); digitalWrite(PIN_CS, HIGH);
   for (auto &key : keyA) memcpy(key, DEFAULT_KEY, sizeof(DEFAULT_KEY));
   Wire.begin(PIN_SDA, PIN_SCL);
-  oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-  if (oledOK) { display.setTextSize(1); display.setTextColor(SSD1306_WHITE); display.setTextWrap(false); }
+  // U8g2 expects an 8-bit I2C address, unlike Wire's 7-bit address.
+  display.setI2CAddress(OLED_ADDR << 1);
+  Wire.beginTransmission(OLED_ADDR);
+  oledOK = (Wire.endTransmission() == 0);
+  if (oledOK) {
+    display.begin();
+    display.setFont(u8g2_font_6x10_tf);
+  } else {
+    Serial.printf("SSD1315 not found at I2C 0x%02X\n", OLED_ADDR);
+  }
   screen("Initializing NFC...");
   spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
   nfcOK = (nfc.rfalNfcInitialize() == ERR_NONE);
