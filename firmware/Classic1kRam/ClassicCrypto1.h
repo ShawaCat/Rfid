@@ -52,7 +52,7 @@ struct Cipher {
     f |= (0x0000D938U >> ((odd >> 16) & 15U)) & 0x01U;
     return (uint8_t)((0xEC57E80AU >> f) & 1U);
   }
-  uint8_t bit(uint8_t in, bool ciphertextInput = false) {
+  uint8_t clockBit(uint8_t in, bool ciphertextInput = false) {
     uint8_t out = filter();
     uint32_t fb = (in & 1U) ^ (ciphertextInput ? out : 0U);
     fb ^= odd & 0x0029CE5CU;
@@ -64,13 +64,13 @@ struct Cipher {
   uint8_t byte(uint8_t in, bool ciphertextInput = false) {
     uint8_t stream = 0;
     for (unsigned i = 0; i < 8; ++i)
-      stream |= bit((in >> i) & 1U, ciphertextInput) << i;
+      stream |= clockBit((in >> i) & 1U, ciphertextInput) << i;
     return stream;
   }
   uint32_t word(uint32_t in, bool ciphertextInput = false) {
     uint32_t stream = 0;
     for (unsigned i = 0; i < 32; ++i)
-      stream |= (uint32_t)bit((in >> (i ^ 24U)) & 1U, ciphertextInput) << (i ^ 24U);
+      stream |= (uint32_t)clockBit((in >> (i ^ 24U)) & 1U, ciphertextInput) << (i ^ 24U);
     return stream;
   }
   // In the encrypted session, input to the LFSR is zero. Crypto1 does not

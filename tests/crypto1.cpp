@@ -1,3 +1,5 @@
+// Arduino.h defines bit(b); exercise the header with that macro enabled.
+#define bit(b) (1UL << (b))
 #include "../firmware/Classic1kRam/ClassicCrypto1.h"
 #include <cassert>
 #include <cstdio>
