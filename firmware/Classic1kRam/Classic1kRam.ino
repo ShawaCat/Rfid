@@ -80,7 +80,29 @@ void showHelp() {
   logStatus("STATUS - mode, UID, valid block count",
             "BLOCK n - print block 0..63; DUMP - print RAM blocks",
             "KEY s 12hex - set sector Key A (0..15), RAM only",
-            "HELP  - this list");
+            "PROBE - read ST25R3916 chip ID; HELP - this list");
+}
+// SPI reads can return ERR_NONE even when MISO is floating: the raw identity
+// byte, not the transport return code, is the useful diagnostic here.
+void probeChip() {
+  if (mode != Mode::Idle) {
+    Serial.println("Use STOP before PROBE.");
+    return;
+  }
+  uint8_t id = 0;
+  const ReturnCode rc = reader.st25r3916ReadRegister(ST25R3916_REG_IC_IDENTITY, &id);
+  Serial.printf("SPI probe (mode 1): SCK=%d MISO=%d MOSI=%d CS=%d IRQ=%d, rc=%d, IC_IDENTITY=0x%02X\n",
+                PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS, PIN_IRQ, (int)rc, id);
+  const uint8_t type = id & ST25R3916_REG_IC_IDENTITY_ic_type_mask;
+  if (type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916 ||
+      type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916b) {
+    Serial.printf("Recognized %s, revision=%u\n",
+                  type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916 ?
+                  "ST25R3916" : "ST25R3916B",
+                  (unsigned)(id & ST25R3916_REG_IC_IDENTITY_ic_rev_mask));
+  } else {
+    Serial.println("Unexpected chip ID: check 3.3V/GND, SPI mode selection, CS/SCK/MOSI/MISO wiring and module pin labels.");
+  }
 }
 void stopPoll() {
   if (nfc.rfalNfcGetState() > RFAL_NFC_STATE_IDLE) nfc.rfalNfcDeactivate(false);
@@ -163,6 +185,7 @@ void handleCommand(char *line) {
   if (dumping) { Serial.println("Busy: use STOP/UID/READ to cancel."); return; }
   if (!strcmp(line, "HELP")) { showHelp(); return; }
   if (!strcmp(line, "STATUS")) { printStatus(); return; }
+  if (!strcmp(line, "PROBE")) { probeChip(); return; }
   if (!strcmp(line, "DUMP")) {
     if (mode != Mode::Idle) { Serial.println("Use STOP before DUMP."); return; }
     if (!card.hasUid) { Serial.println("No snapshot; use READ first."); return; }
@@ -321,11 +344,19 @@ void dumpCard(rfalNfcDevice *first) {
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_CS, OUTPUT); digitalWrite(PIN_CS, HIGH);
+  pinMode(PIN_IRQ, INPUT);
   for (auto &key : keyA) memcpy(key, DEFAULT_KEY, sizeof(DEFAULT_KEY));
   logStatus("ST25R3916 Serial test", "Type HELP for commands.");
   spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
-  nfcOK = (nfc.rfalNfcInitialize() == ERR_NONE);
-  if (!nfcOK) { logStatus("ST25R3916 error", "Check wiring / 3.3V"); showHelp(); return; }
+  probeChip();
+  const ReturnCode initRc = nfc.rfalNfcInitialize();
+  nfcOK = (initRc == ERR_NONE);
+  Serial.printf("rfalNfcInitialize: %d\n", (int)initRc);
+  if (!nfcOK) {
+    logStatus("ST25R3916 init failed", "If IC_IDENTITY is unexpected: check SPI/power.");
+    showHelp();
+    return;
+  }
   discover.compMode = RFAL_COMPLIANCE_MODE_NFC;
   discover.devLimit = 1;
   discover.nfcfBR = RFAL_BR_212;
