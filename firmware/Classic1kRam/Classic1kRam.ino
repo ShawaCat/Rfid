@@ -17,6 +17,8 @@
 namespace {
 constexpr int PIN_SCK = 18, PIN_MISO = 19, PIN_MOSI = 23;
 constexpr int PIN_CS = 5, PIN_IRQ = 4;
+// Bring-up speed. Increase to 5 MHz only after the identity reads reliably.
+constexpr uint32_t NFC_SPI_HZ = 1000000UL;
 constexpr uint8_t SECTORS = 16, BLOCKS = 64, BLOCK_SIZE = 16;
 constexpr uint8_t DEFAULT_KEY[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // Replace individual sector keys as needed. Keys are NEVER recovered from a
@@ -35,7 +37,7 @@ RamCard card = {};
 classic::Session cryptoSession; // reset on every mode change; no RF transport yet
 
 SPIClass spi(VSPI);
-RfalRfST25R3916Class reader(&spi, PIN_CS, PIN_IRQ);
+RfalRfST25R3916Class reader(&spi, PIN_CS, PIN_IRQ, NFC_SPI_HZ);
 RfalNfcClass nfc(&reader);
 RfalMf1Class mf1(&reader);
 bool nfcOK = false;
@@ -91,8 +93,8 @@ void probeChip() {
   }
   uint8_t id = 0;
   const ReturnCode rc = reader.st25r3916ReadRegister(ST25R3916_REG_IC_IDENTITY, &id);
-  Serial.printf("SPI probe (mode 1): SCK=%d MISO=%d MOSI=%d CS=%d IRQ=%d, rc=%d, IC_IDENTITY=0x%02X\n",
-                PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS, PIN_IRQ, (int)rc, id);
+  Serial.printf("SPI probe (mode 1, %lu Hz): SCK=%d MISO=%d MOSI=%d CS=%d IRQ=%d, rc=%d, IC_IDENTITY=0x%02X\n",
+                (unsigned long)NFC_SPI_HZ, PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS, PIN_IRQ, (int)rc, id);
   const uint8_t type = id & ST25R3916_REG_IC_IDENTITY_ic_type_mask;
   if (type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916 ||
       type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916b) {
@@ -351,7 +353,8 @@ void setup() {
   probeChip();
   const ReturnCode initRc = nfc.rfalNfcInitialize();
   nfcOK = (initRc == ERR_NONE);
-  Serial.printf("rfalNfcInitialize: %d\n", (int)initRc);
+  Serial.printf("rfalNfcInitialize: %d%s\n", (int)initRc,
+                initRc == ERR_HW_MISMATCH ? " (ERR_HW_MISMATCH: identity is not 3916/3916B)" : "");
   if (!nfcOK) {
     logStatus("ST25R3916 init failed", "If IC_IDENTITY is unexpected: check SPI/power.");
     showHelp();
