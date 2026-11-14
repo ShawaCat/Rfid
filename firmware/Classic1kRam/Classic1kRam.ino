@@ -103,7 +103,7 @@ void probeChip() {
                   "ST25R3916" : "ST25R3916B",
                   (unsigned)(id & ST25R3916_REG_IC_IDENTITY_ic_rev_mask));
   } else {
-    Serial.println("Unexpected chip ID: check 3.3V/GND, SPI mode selection, CS/SCK/MOSI/MISO wiring and module pin labels.");
+    Serial.println("Unexpected chip ID: check module 5V/GND, SPI mode selection, CS/SCK/MOSI/MISO wiring and module pin labels.");
   }
 }
 void stopPoll() {

@@ -6,18 +6,21 @@ No display or buttons are required. Connect the ESP32 over USB and use the Ardui
 
 **Important:** The sketch reads a card into volatile RAM. `UID` enables ISO14443-A listen/anticollision with the saved UID, ATQA and SAK **only**. It is **not** a MIFARE Classic emulator: no on-air Crypto1 authentication or memory responses. Test only cards you own or are authorized to use.
 
-## Wiring (3.3 V logic; common GND)
+## Wiring (module power 5 V; ESP32 logic 3.3 V; common GND)
 
-| ST25R3916 SPI module | ESP32 GPIO |
+| ELECHOUSE module pin | ESP32 DevKit V1 pin |
 |---|---:|
-| SCK | 18 |
-| MISO/SDO | 19 |
-| MOSI/SDI | 23 |
-| CS/SS | 5 |
-| IRQ | 4 |
-| VCC/GND | 3V3/GND |
+| SCLK/SCL | GPIO18 |
+| MISO/SDA | GPIO19 |
+| MOSI | GPIO23 |
+| CS | GPIO5 |
+| IRQ | GPIO4 |
+| **5V** | **5V / VIN (USB-powered board)** |
+| GND | GND |
 
-Select **SPI mode** on the ST25R3916 module (check its jumpers). The driver uses **SPI mode 1** and defaults to **1 MHz during bring-up** (change `NFC_SPI_HZ` only after the chip is recognized; the original driver default was 5 MHz). If the breakout labels its lines `SCL`/`SDA`, verify whether those labels refer to SPI SCK/MOSI or I2C on your specific board; do not guess. Do not apply 5 V signals to ESP32 GPIOs. The SSD1315 and its four buttons can be left disconnected for this test; GPIO21/22/25/26/32/33 are unused.
+**Correction:** Earlier versions of this README incorrectly connected the module's **5V** input to ESP32 **3V3**. The photographed ELECHOUSE module is labeled `5V` and the [manufacturer's ESP32 guide](https://www.elechouse.com/docs/st25r3916/) specifies **ESP32 VIN/5V → module 5V** (on-board power regulation), while the host SPI/IRQ logic remains 3.3 V. Power everything off before rewiring. Never connect 5 V to an ESP32 GPIO; if in doubt, verify the module output levels before connecting MISO and IRQ. Make sure the ESP32 5V/VIN pin actually supplies 5 V when powered by USB.
+
+Select **SPI mode** on the ST25R3916 module (check its jumpers). The driver uses **SPI mode 1** and defaults to **1 MHz during bring-up** (change `NFC_SPI_HZ` only after the chip is recognized; the original driver default was 5 MHz). On the photographed ELECHOUSE module the shared labels `SCLK/SCL` and `MISO/SDA` mean SPI SCLK and SPI MISO when the I2C jumper is open (default SPI mode). Do not apply 5 V signals to ESP32 GPIOs. The SSD1315 and its four buttons can be left disconnected for this test; GPIO21/22/25/26/32/33 are unused.
 
 ## Build
 
@@ -42,7 +45,7 @@ Reference revision: `76d85da7b7e9cb89042eb0e31e070fec91030abb`. No OLED/graphics
 
 Suggested test: send `STATUS`, then `READ` and present a card with **4-byte UID, SAK 0x08**. Wait for `READ finished` or `PARTIAL READ`. The sketch attempts each of 16 sectors with Key A `FF FF FF FF FF FF`; before `READ`, use `KEY <sector> <12hex>` if your own card requires a different Key A. This command only works while idle, never prints the key, and the key is lost on reset. A terminal may retain the command you typed in its history/log, so do not share an unredacted serial transcript containing secret keys. It reacquires the same UID for each sector. Errors and successful blocks are printed as they occur. `STOP` can cancel a dump at the next command check. Then try `STATUS`, `BLOCK 0`, `DUMP`, and optionally `UID` with a second NFC reader. **A smartphone may not detect the UID-only target and cannot read its Classic memory.**
 
-All 64 blocks take 1024 bytes of RAM; a new valid read clears the old snapshot and power cycling loses it. Failed blocks stay `unread`. Sector-trailer key bytes are *masked* because keys cannot be read back from a card; even a `64/64` result is not a complete clone. The physical card is never written to. Logs contain the card UID and block data: redact them before sharing if sensitive. This project has not been verified on physical hardware. At boot the sketch prints `IC_IDENTITY` (register `0x3F`) and the numeric result of `rfalNfcInitialize`. If initialization fails, send `PROBE` again. `0x00`, `0xFF` or other unexpected identity values strongly suggest a SPI/power/interface problem; `rc=0` from an SPI register read alone does **not** prove the chip is connected. `rfalNfcInitialize: 36` means `ERR_HW_MISMATCH` (the ID register is not a recognized 3916/3916B). If ID consistently reads `0x20` rather than `0x28`/`0x30`, do not disable the identity check; check actual chip marking, board jumpers and SPI wiring instead. The 3916 driver accepts `(id & 0xF8) == 0x28` (ST25R3916) or `0x30` (ST25R3916B). Share the raw identity and init result, exact module model, interface jumper positions and actual wiring for diagnosis. The ESP32 boot lines preceding `ST25R3916 Serial test` are normal.
+All 64 blocks take 1024 bytes of RAM; a new valid read clears the old snapshot and power cycling loses it. Failed blocks stay `unread`. Sector-trailer key bytes are *masked* because keys cannot be read back from a card; even a `64/64` result is not a complete clone. The physical card is never written to. Logs contain the card UID and block data: redact them before sharing if sensitive. This project has not been verified on physical hardware. At boot the sketch prints `IC_IDENTITY` (register `0x3F`) and the numeric result of `rfalNfcInitialize`. If initialization fails, send `PROBE` again. `0x00`, `0xFF` or other unexpected identity values strongly suggest a SPI/power/interface problem; `rc=0` from an SPI register read alone does **not** prove the chip is connected. `rfalNfcInitialize: 36` means `ERR_HW_MISMATCH` (the ID register is not a recognized 3916/3916B). If ID consistently reads `0x20` rather than `0x28`/`0x30`, do not disable the identity check; first verify the module is powered from its labeled 5V input, then check chip marking, board jumpers and SPI wiring. The 3916 driver accepts `(id & 0xF8) == 0x28` (ST25R3916) or `0x30` (ST25R3916B). Share the raw identity and init result, exact module model, interface jumper positions and actual wiring for diagnosis. The ESP32 boot lines preceding `ST25R3916 Serial test` are normal.
 
 ## Crypto1 groundwork (not an RF emulator yet)
 
