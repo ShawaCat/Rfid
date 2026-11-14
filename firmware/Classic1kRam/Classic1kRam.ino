@@ -1,27 +1,22 @@
-/* ESP32 DevKit V1 + ST25R3916 (SPI) + SSD1315 128x64 (I2C).
+/* ESP32 DevKit V1 + ST25R3916 (SPI), Serial-only test firmware.
  * Read-only MIFARE Classic 1K dump in RAM; listen mode advertises the saved
  * ISO14443-A UID only. Crypto1 software is in ClassicCrypto1.h but the
  * hardware transport for encrypted parity is NOT implemented yet.
  */
 #include <Arduino.h>
 #include <SPI.h>
-#include <Wire.h>
-#include <U8g2lib.h>
 #include "ClassicCrypto1.h"
 #include <rfal_mf1.h>
 #include <rfal_nfc.h>
 #include <rfal_rfst25r3916.h>
 #include <st_errno.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
 
 namespace {
 constexpr int PIN_SCK = 18, PIN_MISO = 19, PIN_MOSI = 23;
 constexpr int PIN_CS = 5, PIN_IRQ = 4;
-constexpr int PIN_SDA = 21, PIN_SCL = 22;
-// Default for four independent buttons. Change to match YOUR module pinout.
-constexpr int PIN_READ = 32, PIN_LISTEN = 33;
-constexpr int PIN_PREV = 25, PIN_NEXT = 26; // active low, internal pullups
-constexpr uint8_t OLED_ADDR = 0x3C;
 constexpr uint8_t SECTORS = 16, BLOCKS = 64, BLOCK_SIZE = 16;
 constexpr uint8_t DEFAULT_KEY[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // Replace individual sector keys as needed. Keys are NEVER recovered from a
@@ -43,8 +38,7 @@ SPIClass spi(VSPI);
 RfalRfST25R3916Class reader(&spi, PIN_CS, PIN_IRQ);
 RfalNfcClass nfc(&reader);
 RfalMf1Class mf1(&reader);
-U8G2_SSD1315_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
-bool oledOK = false, nfcOK = false;
+bool nfcOK = false;
 rfalNfcDiscoverParam discover = {};
 // Buffers passed to RFAL must outlive rfalListenStart(). Length is in bits.
 uint8_t listenRx[32] = {};
@@ -52,54 +46,41 @@ uint16_t listenBits = 0;
 
 enum class Mode { Idle, Read, ListenUid };
 Mode mode = Mode::Idle;
-uint32_t modeGeneration = 0; // cancel an in-progress dump on any button press
+uint32_t modeGeneration = 0; // cancel an in-progress dump on any serial mode command
 
-struct Button {
-  int pin;
-  bool raw = false, stable = false;
-  uint32_t changedAt = 0;
-  bool pressed() {
-    bool now = (digitalRead(pin) == LOW);
-    if (now != raw) { raw = now; changedAt = millis(); }
-    if (now != stable && millis() - changedAt >= 35) {
-      stable = now;
-      return stable; // one event per debounced press
-    }
-    return false;
-  }
-};
-Button readButton{PIN_READ}, listenButton{PIN_LISTEN};
-Button prevButton{PIN_PREV}, nextButton{PIN_NEXT};
-uint8_t selectedBlock = 0;
+// Read serial without delay/readStringUntil so the NFC worker keeps running.
+char input[48] = {};
+size_t inputLength = 0;
+bool inputOverflow = false;
+bool dumping = false;
 
-void screen(const char *a, const char *b = "", const char *c = "", const char *d = "") {
-  Serial.printf("%s | %s | %s | %s\n", a, b, c, d);
-  if (!oledOK) return;
-  display.clearBuffer();
-  display.drawStr(0, 10, a);
-  display.drawStr(0, 26, b);
-  display.drawStr(0, 39, c);
-  display.drawStr(0, 52, d);
-  display.sendBuffer();
+void logStatus(const char *a, const char *b = "", const char *c = "", const char *d = "") {
+  Serial.println(a);
+  if (*b) Serial.println(b);
+  if (*c) Serial.println(c);
+  if (*d) Serial.println(d);
 }
 void uidText(char *out, size_t n) {
   snprintf(out, n, "%02X:%02X:%02X:%02X", card.uid[0], card.uid[1], card.uid[2], card.uid[3]);
 }
-void showBlock() {
-  if (!card.hasUid) return;
-  char title[24], first[17], second[17];
-  snprintf(title, sizeof(title), "Block %02u/63 %s", selectedBlock,
-           card.valid[selectedBlock] ? "OK" : "unread");
-  if (card.valid[selectedBlock]) {
-    for (uint8_t i = 0; i < 8; ++i) {
-      snprintf(first + 2 * i, 3, "%02X", card.blocks[selectedBlock][i]);
-      snprintf(second + 2 * i, 3, "%02X", card.blocks[selectedBlock][i + 8]);
-    }
-  } else {
-    strcpy(first, "No block data");
-    second[0] = '\0';
+void showBlock(uint8_t block) {
+  if (!card.hasUid || !card.valid[block]) {
+    Serial.printf("Block %u: unread\n", block);
+    return;
   }
-  screen(title, first, second, "25=prev  26=next");
+  Serial.printf("Block %02u%s: ", block, block % 4 == 3 ? " trailer (keys masked)" : "");
+  for (uint8_t v : card.blocks[block]) Serial.printf("%02X", v);
+  Serial.println();
+}
+void showHelp() {
+  logStatus("Commands (115200 baud, newline):",
+            "READ  - scan and dump one Classic 1K into RAM",
+            "UID   - listen with saved UID only (NOT Classic emulation)",
+            "STOP  - stop NFC; keep RAM snapshot");
+  logStatus("STATUS - mode, UID, valid block count",
+            "BLOCK n - print block 0..63; DUMP - print RAM blocks",
+            "KEY s 12hex - set sector Key A (0..15), RAM only",
+            "HELP  - this list");
 }
 void stopPoll() {
   if (nfc.rfalNfcGetState() > RFAL_NFC_STATE_IDLE) nfc.rfalNfcDeactivate(false);
@@ -107,27 +88,28 @@ void stopPoll() {
 void startRead() {
   ++modeGeneration;
   cryptoSession.reset();
-  if (!nfcOK) { screen("ST25R3916 error", "Check SPI + IRQ"); return; }
+  if (!nfcOK) { logStatus("ST25R3916 error", "Check SPI + IRQ"); return; }
   if (mode == Mode::ListenUid) reader.rfalListenStop();
   stopPoll();
   mode = Mode::Read;
   const ReturnCode rc = nfc.rfalNfcDiscover(&discover);
   if (rc != ERR_NONE) {
     mode = Mode::Idle;
-    screen("Poll failed", "See Serial");
+    logStatus("Poll failed", "See Serial");
     Serial.printf("rfalNfcDiscover: %d\n", (int)rc);
   } else {
-    screen("READ Classic 1K", "Present 4-byte UID", "Default Key A: FF*6", "32=read 33=listen");
+    logStatus("READ Classic 1K", "Present 4-byte UID (SAK 08)",
+              "Default Key A: FF*6", "STOP/UID to cancel");
   }
 }
 void startListen() {
   ++modeGeneration;
   cryptoSession.reset();
-  if (!nfcOK) { screen("ST25R3916 error", "Check SPI + IRQ"); return; }
+  if (!nfcOK) { logStatus("ST25R3916 error", "Check SPI + IRQ"); return; }
   if (mode == Mode::ListenUid) reader.rfalListenStop();
   stopPoll();
   mode = Mode::Idle;
-  if (!card.hasUid) { screen("NO CARD IN RAM", "Read a card first"); return; }
+  if (!card.hasUid) { logStatus("NO CARD IN RAM", "Read a card first"); return; }
 
   rfalLmConfPA conf = {};
   conf.nfcidLen = RFAL_LM_NFCID_LEN_04;
@@ -138,26 +120,109 @@ void startListen() {
   const ReturnCode rc = reader.rfalListenStart(RFAL_LM_MASK_NFCA, &conf, nullptr, nullptr,
                                                 listenRx, sizeof(listenRx) * 8U, &listenBits);
   if (rc != ERR_NONE) {
-    screen("Listen failed", "See Serial");
+    logStatus("Listen failed", "See Serial");
     Serial.printf("rfalListenStart: %d\n", (int)rc);
     return;
   }
   mode = Mode::ListenUid;
   char uid[20]; uidText(uid, sizeof(uid));
-  screen("UID ONLY - NOT MF1", uid, "No auth / no blocks", "READ to exit");
+  logStatus("UID ONLY - NOT MF1", uid, "No auth / no blocks", "READ or STOP to exit");
 }
 
-// Returns false if a mode button was pressed during a blocking dump.
-bool checkButtons() {
-  bool r = readButton.pressed(), l = listenButton.pressed();
-  bool prev = prevButton.pressed(), next = nextButton.pressed();
-  if (l) { startListen(); return false; }
-  if (r) { startRead(); return false; }
-  // Browsing is deliberately disabled during NFC operations (no OLED I2C
-  // traffic in the response path). It is only available after a read.
-  if (mode == Mode::Idle && card.hasUid && (prev || next)) {
-    selectedBlock = (selectedBlock + (next ? 1U : 63U)) % BLOCKS;
-    showBlock();
+void stopNfc() {
+  ++modeGeneration;
+  cryptoSession.reset();
+  if (mode == Mode::ListenUid) reader.rfalListenStop();
+  stopPoll();
+  mode = Mode::Idle;
+  logStatus("NFC stopped; RAM snapshot retained.");
+}
+void printStatus() {
+  char uid[20] = "none";
+  unsigned count = 0;
+  if (card.hasUid) {
+    uidText(uid, sizeof(uid));
+    for (bool valid : card.valid) if (valid) ++count;
+  }
+  const char *name = mode == Mode::Read ? "READ" :
+                     mode == Mode::ListenUid ? "UID-ONLY" : "IDLE";
+  Serial.printf("NFC=%s mode=%s UID=%s blocks=%u/64\n",
+                nfcOK ? "ready" : "error", name, uid, count);
+  Serial.println("Listen mode does not implement Classic AUTH/READ.");
+}
+void handleCommand(char *line) {
+  while (*line == ' ' || *line == '\t') ++line;
+  size_t len = strlen(line);
+  while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) line[--len] = '\0';
+  for (char *p = line; *p; ++p) *p = (char)toupper((unsigned char)*p);
+  if (!*line) return;
+  if (!strcmp(line, "STOP")) { stopNfc(); return; }
+  if (!strcmp(line, "READ")) { startRead(); return; }
+  if (!strcmp(line, "UID")) { startListen(); return; }
+  // Serial output during a card transaction may miss strict NFC deadlines.
+  if (dumping) { Serial.println("Busy: use STOP/UID/READ to cancel."); return; }
+  if (!strcmp(line, "HELP")) { showHelp(); return; }
+  if (!strcmp(line, "STATUS")) { printStatus(); return; }
+  if (!strcmp(line, "DUMP")) {
+    if (mode != Mode::Idle) { Serial.println("Use STOP before DUMP."); return; }
+    if (!card.hasUid) { Serial.println("No snapshot; use READ first."); return; }
+    for (uint8_t i = 0; i < BLOCKS; ++i) showBlock(i);
+    return;
+  }
+  if (!strncmp(line, "KEY ", 4)) {
+    if (mode != Mode::Idle) { Serial.println("Use STOP before KEY."); return; }
+    char *end = nullptr;
+    unsigned long sector = strtoul(line + 4, &end, 10);
+    if (end == line + 4 || sector >= SECTORS || *end != ' ') {
+      Serial.println("Usage: KEY 0 FFFFFFFFFFFF (sector 0..15)"); return;
+    }
+    while (*end == ' ') ++end;
+    if (strlen(end) != 12) {
+      Serial.println("Key A must contain exactly 12 hex digits."); return;
+    }
+    uint8_t parsed[6];
+    for (uint8_t i = 0; i < 6; ++i) {
+      const char hi = end[2 * i], lo = end[2 * i + 1];
+      if (!isxdigit((unsigned char)hi) || !isxdigit((unsigned char)lo)) {
+        Serial.println("Key A must contain exactly 12 hex digits."); return;
+      }
+      const uint8_t h = hi <= '9' ? hi - '0' : hi - 'A' + 10;
+      const uint8_t l = lo <= '9' ? lo - '0' : lo - 'A' + 10;
+      parsed[i] = (h << 4) | l;
+    }
+    memcpy(keyA[sector], parsed, sizeof(parsed));
+    Serial.printf("Key A for sector %lu updated in RAM (not printed).\n", sector);
+    return;
+  }
+  if (!strncmp(line, "BLOCK ", 6)) {
+    if (mode != Mode::Idle) { Serial.println("Use STOP before BLOCK."); return; }
+    char *end = nullptr;
+    unsigned long index = strtoul(line + 6, &end, 10);
+    if (end != line + 6 && *end == '\0' && index < BLOCKS) {
+      showBlock((uint8_t)index);
+      return;
+    }
+    Serial.println("Usage: BLOCK 0..63");
+    return;
+  }
+  Serial.println("Unknown command. Type HELP.");
+}
+// One bounded command per call; CR/LF and CRLF work in Arduino Serial Monitor.
+// Returns false when a mode change interrupted the current dump.
+bool serviceSerial() {
+  const uint32_t generation = modeGeneration;
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (inputOverflow) Serial.println("Command too long; type HELP.");
+      else if (inputLength) { input[inputLength] = '\0'; handleCommand(input); }
+      inputLength = 0;
+      inputOverflow = false;
+    } else if (!inputOverflow) {
+      if (inputLength < sizeof(input) - 1) input[inputLength++] = c;
+      else inputOverflow = true;
+    }
+    if (modeGeneration != generation) return false;
   }
   return true;
 }
@@ -167,7 +232,7 @@ bool acquire(const uint8_t expectedUid[4], rfalNfcDevice **out, uint32_t generat
   if (nfc.rfalNfcDiscover(&discover) != ERR_NONE) return false;
   const uint32_t start = millis();
   while (millis() - start < 2000) {
-    if (!checkButtons() || modeGeneration != generation) return false;
+    if (!serviceSerial() || modeGeneration != generation) return false;
     nfc.rfalNfcWorker();
     if (nfc.rfalNfcGetState() == RFAL_NFC_STATE_ACTIVATED) {
       rfalNfcDevice *dev = nullptr;
@@ -183,10 +248,9 @@ bool acquire(const uint8_t expectedUid[4], rfalNfcDevice **out, uint32_t generat
 void dumpCard(rfalNfcDevice *first) {
   if (!first || !RfalMf1Class::isNfcaDevice(first) || first->nfcidLen != 4 ||
       first->dev.nfca.selRes.sak != 0x08) {
-    screen("Not Classic 1K", "Need 4-byte UID", "and SAK 08");
+    logStatus("Not Classic 1K", "Need 4-byte UID", "and SAK 08");
     stopPoll(); mode = Mode::Idle; return;
   }
-  selectedBlock = 0;
   // Invalidate the old snapshot before any new attempt. A partial dump is
   // visible on Serial but cannot silently masquerade as a complete dump.
   memset(&card, 0, sizeof(card));
@@ -200,14 +264,15 @@ void dumpCard(rfalNfcDevice *first) {
   Serial.printf("Classic 1K UID=%s ATQA=%02X %02X SAK=%02X\n",
                 uid, card.atqa[0], card.atqa[1], card.sak);
   const uint32_t generation = modeGeneration;
+  dumping = true;
   unsigned good = 0;
   for (uint8_t sector = 0; sector < SECTORS; ++sector) {
-    if (!checkButtons() || modeGeneration != generation) return;
+    if (!serviceSerial() || modeGeneration != generation) { dumping = false; return; }
     rfalNfcDevice *dev = nullptr;
     // MF1 sessions may be invalidated by an error/end of sector. Always
     // reactivate before authenticating the next sector.
     if (!acquire(expected, &dev, generation)) {
-      if (modeGeneration != generation) return;
+      if (modeGeneration != generation) { dumping = false; return; }
       Serial.printf("Sector %u: reacquire failed\n", sector);
       break;
     }
@@ -219,7 +284,7 @@ void dumpCard(rfalNfcDevice *first) {
       continue;
     }
     for (uint8_t offset = 0; offset < 4; ++offset) {
-      if (!checkButtons() || modeGeneration != generation) return;
+      if (!serviceSerial() || modeGeneration != generation) { dumping = false; return; }
       const uint8_t block = base + offset;
       uint8_t data[BLOCK_SIZE] = {};
       rc = mf1.readBlock(&crypto, block, data);
@@ -242,50 +307,36 @@ void dumpCard(rfalNfcDevice *first) {
     }
     char progress[24]; snprintf(progress, sizeof(progress), "Sector %u/16", sector + 1);
     char count[24]; snprintf(count, sizeof(count), "Blocks %u/64", good);
-    screen("READ Classic 1K", uid, progress, count);
+    logStatus("READ Classic 1K", uid, progress, count);
   }
   stopPoll(); mode = Mode::Idle;
+  dumping = false;
   char count[24]; snprintf(count, sizeof(count), "%u/64 blocks in RAM", good);
-  screen(good == BLOCKS ? "READ finished" : "PARTIAL READ", uid, count,
-         "25/26 browse blocks");
+  logStatus(good == BLOCKS ? "READ finished" : "PARTIAL READ", uid, count,
+         "Use BLOCK n or DUMP to inspect RAM");
   Serial.println("RAM is volatile. Trailer keys are not recovered. UID-only listen is NOT Classic emulation.");
 }
 } // namespace
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_READ, INPUT_PULLUP);
-  pinMode(PIN_LISTEN, INPUT_PULLUP);
-  pinMode(PIN_PREV, INPUT_PULLUP);
-  pinMode(PIN_NEXT, INPUT_PULLUP);
   pinMode(PIN_CS, OUTPUT); digitalWrite(PIN_CS, HIGH);
   for (auto &key : keyA) memcpy(key, DEFAULT_KEY, sizeof(DEFAULT_KEY));
-  Wire.begin(PIN_SDA, PIN_SCL);
-  // U8g2 expects an 8-bit I2C address, unlike Wire's 7-bit address.
-  display.setI2CAddress(OLED_ADDR << 1);
-  Wire.beginTransmission(OLED_ADDR);
-  oledOK = (Wire.endTransmission() == 0);
-  if (oledOK) {
-    display.begin();
-    display.setFont(u8g2_font_6x10_tf);
-  } else {
-    Serial.printf("SSD1315 not found at I2C 0x%02X\n", OLED_ADDR);
-  }
-  screen("Initializing NFC...");
+  logStatus("ST25R3916 Serial test", "Type HELP for commands.");
   spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
   nfcOK = (nfc.rfalNfcInitialize() == ERR_NONE);
-  if (!nfcOK) { screen("ST25R3916 error", "Check wiring / 3.3V"); return; }
+  if (!nfcOK) { logStatus("ST25R3916 error", "Check wiring / 3.3V"); showHelp(); return; }
   discover.compMode = RFAL_COMPLIANCE_MODE_NFC;
   discover.devLimit = 1;
   discover.nfcfBR = RFAL_BR_212;
   discover.ap2pBR = RFAL_BR_424;
   discover.totalDuration = 1000;
   discover.techs2Find = RFAL_NFC_POLL_TECH_A;
-  startRead();
+  showHelp();
 }
 
 void loop() {
-  if (!checkButtons()) return;
+  if (!serviceSerial()) return;
   if (mode == Mode::Read) {
     nfc.rfalNfcWorker();
     if (nfc.rfalNfcGetState() == RFAL_NFC_STATE_ACTIVATED) {
