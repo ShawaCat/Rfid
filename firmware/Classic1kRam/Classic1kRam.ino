@@ -134,9 +134,15 @@ void serviceSerial() {
   }
 }
 void onCard(rfalNfcDevice *dev) {
-  if (!dev || dev->type != RFAL_NFC_POLL_TYPE_NFCA || dev->nfcidLen == 0 ||
-      dev->nfcidLen > sizeof(saved.uid)) {
-    Serial.println("Unsupported card/UID length.");
+  // A remote tag is a LISTENER even though this ESP32 is POLLING it. Match
+  // the upstream scanner's isNfcaDevice() check; POLL_TYPE_NFCA describes
+  // a remote reader, not the normal card we just detected.
+  if (!dev || (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA &&
+               dev->type != RFAL_NFC_POLL_TYPE_NFCA) ||
+      !dev->nfcid || dev->nfcidLen == 0 || dev->nfcidLen > sizeof(saved.uid)) {
+    Serial.printf("Unsupported device: type=%d uidLen=%u (max %u)\n",
+                  dev ? (int)dev->type : -1,
+                  dev ? (unsigned)dev->nfcidLen : 0U, (unsigned)sizeof(saved.uid));
     stopNfc();
     return;
   }
