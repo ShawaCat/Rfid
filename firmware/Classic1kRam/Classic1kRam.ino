@@ -1,389 +1,183 @@
-/* ESP32 DevKit V1 + ST25R3916 (SPI), Serial-only test firmware.
- * Read-only MIFARE Classic 1K dump in RAM; listen mode advertises the saved
- * ISO14443-A UID only. Crypto1 software is in ClassicCrypto1.h but the
- * hardware transport for encrypted parity is NOT implemented yet.
+/* ESP32 DevKit V1 + ELECHOUSE ST25R3916 (SPI): ISO14443-A UID test.
+ * No screen, keys, card blocks, Crypto1 or Classic emulation.
+ * The listen mode advertises only the saved UID/ATQA/SAK.
  */
 #include <Arduino.h>
 #include <SPI.h>
-#include "ClassicCrypto1.h"
-#include <rfal_mf1.h>
 #include <rfal_nfc.h>
 #include <rfal_rfst25r3916.h>
+#include <st25r3916_config.h>
 #include <st_errno.h>
-#include <string.h>
 #include <ctype.h>
-#include <stdlib.h>
+#include <string.h>
 
 namespace {
 constexpr int PIN_SCK = 18, PIN_MISO = 19, PIN_MOSI = 23;
 constexpr int PIN_CS = 5, PIN_IRQ = 4;
-// Bring-up speed. Increase to 5 MHz only after the identity reads reliably.
-constexpr uint32_t NFC_SPI_HZ = 1000000UL;
-constexpr uint8_t SECTORS = 16, BLOCKS = 64, BLOCK_SIZE = 16;
-constexpr uint8_t DEFAULT_KEY[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-// Replace individual sector keys as needed. Keys are NEVER recovered from a
-// Classic sector trailer by reading it.
-uint8_t keyA[SECTORS][6];
-
-struct RamCard {
-  uint8_t blocks[BLOCKS][BLOCK_SIZE];
-  bool valid[BLOCKS];
-  uint8_t uid[4];
-  uint8_t atqa[2];
-  uint8_t sak;
-  bool hasUid;
-};
-RamCard card = {};
-classic::Session cryptoSession; // reset on every mode change; no RF transport yet
 
 SPIClass spi(VSPI);
-RfalRfST25R3916Class reader(&spi, PIN_CS, PIN_IRQ, NFC_SPI_HZ);
+// Use the same SPI constructor and default clock as the working upstream
+// ESP32_SPI_scan_14443A_led example. No register access before initialize().
+RfalRfST25R3916Class reader(&spi, PIN_CS, PIN_IRQ);
 RfalNfcClass nfc(&reader);
-RfalMf1Class mf1(&reader);
-bool nfcOK = false;
 rfalNfcDiscoverParam discover = {};
-// Buffers passed to RFAL must outlive rfalListenStart(). Length is in bits.
-uint8_t listenRx[32] = {};
-uint16_t listenBits = 0;
+
+struct UidSnapshot {
+  uint8_t uid[10] = {};
+  uint8_t length = 0;
+  uint8_t atqa[2] = {};
+  uint8_t sak = 0;
+  bool valid = false;
+};
+UidSnapshot saved;
 
 enum class Mode { Idle, Read, ListenUid };
 Mode mode = Mode::Idle;
-uint32_t modeGeneration = 0; // cancel an in-progress dump on any serial mode command
+bool nfcReady = false;
+// RFAL retains these pointers for as long as listen mode is running.
+uint8_t listenRx[32] = {};
+uint16_t listenBits = 0;
+char command[32] = {};
+size_t commandLength = 0;
+bool commandOverflow = false;
 
-// Read serial without delay/readStringUntil so the NFC worker keeps running.
-char input[48] = {};
-size_t inputLength = 0;
-bool inputOverflow = false;
-bool dumping = false;
-
-void logStatus(const char *a, const char *b = "", const char *c = "", const char *d = "") {
-  Serial.println(a);
-  if (*b) Serial.println(b);
-  if (*c) Serial.println(c);
-  if (*d) Serial.println(d);
-}
-void uidText(char *out, size_t n) {
-  snprintf(out, n, "%02X:%02X:%02X:%02X", card.uid[0], card.uid[1], card.uid[2], card.uid[3]);
-}
-void showBlock(uint8_t block) {
-  if (!card.hasUid || !card.valid[block]) {
-    Serial.printf("Block %u: unread\n", block);
-    return;
+void printUid() {
+  if (!saved.valid) { Serial.println("No UID in RAM. Send READ first."); return; }
+  Serial.print("UID ("); Serial.print(saved.length); Serial.print(" bytes): ");
+  for (uint8_t i = 0; i < saved.length; ++i) {
+    if (i) Serial.print(':');
+    if (saved.uid[i] < 0x10) Serial.print('0');
+    Serial.print(saved.uid[i], HEX);
   }
-  Serial.printf("Block %02u%s: ", block, block % 4 == 3 ? " trailer (keys masked)" : "");
-  for (uint8_t v : card.blocks[block]) Serial.printf("%02X", v);
-  Serial.println();
+  Serial.printf("  ATQA=%02X%02X SAK=%02X\n", saved.atqa[0], saved.atqa[1], saved.sak);
 }
-void showHelp() {
-  logStatus("Commands (115200 baud, newline):",
-            "READ  - scan and dump one Classic 1K into RAM",
-            "UID   - listen with saved UID only (NOT Classic emulation)",
-            "STOP  - stop NFC; keep RAM snapshot");
-  logStatus("STATUS - mode, UID, valid block count",
-            "BLOCK n - print block 0..63; DUMP - print RAM blocks",
-            "KEY s 12hex - set sector Key A (0..15), RAM only",
-            "PROBE - read ST25R3916 chip ID; HELP - this list");
-}
-// SPI reads can return ERR_NONE even when MISO is floating: the raw identity
-// byte, not the transport return code, is the useful diagnostic here.
-void probeChip() {
-  if (mode != Mode::Idle) {
-    Serial.println("Use STOP before PROBE.");
-    return;
-  }
-  uint8_t id = 0;
-  const ReturnCode rc = reader.st25r3916ReadRegister(ST25R3916_REG_IC_IDENTITY, &id);
-  Serial.printf("SPI probe (mode 1, %lu Hz): SCK=%d MISO=%d MOSI=%d CS=%d IRQ=%d, rc=%d, IC_IDENTITY=0x%02X\n",
-                (unsigned long)NFC_SPI_HZ, PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS, PIN_IRQ, (int)rc, id);
-  const uint8_t type = id & ST25R3916_REG_IC_IDENTITY_ic_type_mask;
-  if (type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916 ||
-      type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916b) {
-    Serial.printf("Recognized %s, revision=%u\n",
-                  type == ST25R3916_REG_IC_IDENTITY_ic_type_st25r3916 ?
-                  "ST25R3916" : "ST25R3916B",
-                  (unsigned)(id & ST25R3916_REG_IC_IDENTITY_ic_rev_mask));
-  } else {
-    Serial.println("Unexpected chip ID: check module 5V/GND, SPI mode selection, CS/SCK/MOSI/MISO wiring and module pin labels.");
-  }
-}
-void stopPoll() {
-  if (nfc.rfalNfcGetState() > RFAL_NFC_STATE_IDLE) nfc.rfalNfcDeactivate(false);
-}
-void startRead() {
-  ++modeGeneration;
-  cryptoSession.reset();
-  if (!nfcOK) { logStatus("ST25R3916 error", "Check SPI + IRQ"); return; }
+void stopNfc() {
   if (mode == Mode::ListenUid) reader.rfalListenStop();
-  stopPoll();
-  mode = Mode::Read;
+  if (nfcReady && nfc.rfalNfcGetState() > RFAL_NFC_STATE_IDLE)
+    nfc.rfalNfcDeactivate(false);
+  mode = Mode::Idle; // Do not clear RAM on STOP or mode changes.
+}
+void beginRead() {
+  if (!nfcReady) { Serial.println("NFC initialization failed; check SPI."); return; }
+  stopNfc();
   const ReturnCode rc = nfc.rfalNfcDiscover(&discover);
-  if (rc != ERR_NONE) {
-    mode = Mode::Idle;
-    logStatus("Poll failed", "See Serial");
-    Serial.printf("rfalNfcDiscover: %d\n", (int)rc);
-  } else {
-    logStatus("READ Classic 1K", "Present 4-byte UID (SAK 08)",
-              "Default Key A: FF*6", "STOP/UID to cancel");
-  }
+  if (rc != ERR_NONE) { Serial.printf("Discover failed: %d\n", (int)rc); return; }
+  mode = Mode::Read;
+  Serial.println("Scanning ISO14443-A... present a card (STOP to cancel).");
 }
-void startListen() {
-  ++modeGeneration;
-  cryptoSession.reset();
-  if (!nfcOK) { logStatus("ST25R3916 error", "Check SPI + IRQ"); return; }
-  if (mode == Mode::ListenUid) reader.rfalListenStop();
-  stopPoll();
-  mode = Mode::Idle;
-  if (!card.hasUid) { logStatus("NO CARD IN RAM", "Read a card first"); return; }
-
+void beginListen() {
+  if (!nfcReady) { Serial.println("NFC initialization failed; check SPI."); return; }
+  stopNfc();
+  if (!saved.valid) { Serial.println("No UID in RAM. Send READ first."); return; }
+  if (saved.length != 4 && saved.length != 7) {
+    Serial.println("This RFAL listen mode supports only 4- or 7-byte UIDs."); return;
+  }
   rfalLmConfPA conf = {};
-  conf.nfcidLen = RFAL_LM_NFCID_LEN_04;
-  memcpy(conf.nfcid, card.uid, 4);
-  memcpy(conf.SENS_RES, card.atqa, 2);
-  conf.SEL_RES = card.sak;
-  // The chip handles anticollision; the firmware has NO Crypto1 PICC handler.
+  conf.nfcidLen = saved.length == 4 ? RFAL_LM_NFCID_LEN_04 : RFAL_LM_NFCID_LEN_07;
+  memcpy(conf.nfcid, saved.uid, saved.length);
+  memcpy(conf.SENS_RES, saved.atqa, sizeof(saved.atqa));
+  conf.SEL_RES = saved.sak;
   const ReturnCode rc = reader.rfalListenStart(RFAL_LM_MASK_NFCA, &conf, nullptr, nullptr,
                                                 listenRx, sizeof(listenRx) * 8U, &listenBits);
-  if (rc != ERR_NONE) {
-    logStatus("Listen failed", "See Serial");
-    Serial.printf("rfalListenStart: %d\n", (int)rc);
-    return;
-  }
+  if (rc != ERR_NONE) { Serial.printf("Listen failed: %d\n", (int)rc); return; }
   mode = Mode::ListenUid;
-  char uid[20]; uidText(uid, sizeof(uid));
-  logStatus("UID ONLY - NOT MF1", uid, "No auth / no blocks", "READ or STOP to exit");
+  Serial.println("UID-ONLY listen mode: no authentication or card data. STOP to exit.");
+  printUid();
 }
-
-void stopNfc() {
-  ++modeGeneration;
-  cryptoSession.reset();
-  if (mode == Mode::ListenUid) reader.rfalListenStop();
-  stopPoll();
-  mode = Mode::Idle;
-  logStatus("NFC stopped; RAM snapshot retained.");
-}
-void printStatus() {
-  char uid[20] = "none";
-  unsigned count = 0;
-  if (card.hasUid) {
-    uidText(uid, sizeof(uid));
-    for (bool valid : card.valid) if (valid) ++count;
-  }
-  const char *name = mode == Mode::Read ? "READ" :
-                     mode == Mode::ListenUid ? "UID-ONLY" : "IDLE";
-  Serial.printf("NFC=%s mode=%s UID=%s blocks=%u/64\n",
-                nfcOK ? "ready" : "error", name, uid, count);
-  Serial.println("Listen mode does not implement Classic AUTH/READ.");
+void printHelp() {
+  Serial.println("Commands (115200 baud, newline):");
+  Serial.println("READ   - scan one ISO14443-A UID into RAM");
+  Serial.println("EMU    - advertise saved UID/ATQA/SAK only (NOT a Classic card)");
+  Serial.println("UID    - print saved UID/ATQA/SAK");
+  Serial.println("STOP   - stop scan/listen, keep saved UID");
+  Serial.println("STATUS - show current mode and saved UID");
+  Serial.println("HELP   - show commands");
 }
 void handleCommand(char *line) {
   while (*line == ' ' || *line == '\t') ++line;
-  size_t len = strlen(line);
-  while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) line[--len] = '\0';
+  size_t length = strlen(line);
+  while (length && (line[length - 1] == ' ' || line[length - 1] == '\t')) line[--length] = '\0';
   for (char *p = line; *p; ++p) *p = (char)toupper((unsigned char)*p);
   if (!*line) return;
-  if (!strcmp(line, "STOP")) { stopNfc(); return; }
-  if (!strcmp(line, "READ")) { startRead(); return; }
-  if (!strcmp(line, "UID")) { startListen(); return; }
-  // Serial output during a card transaction may miss strict NFC deadlines.
-  if (dumping) { Serial.println("Busy: use STOP/UID/READ to cancel."); return; }
-  if (!strcmp(line, "HELP")) { showHelp(); return; }
-  if (!strcmp(line, "STATUS")) { printStatus(); return; }
-  if (!strcmp(line, "PROBE")) { probeChip(); return; }
-  if (!strcmp(line, "DUMP")) {
-    if (mode != Mode::Idle) { Serial.println("Use STOP before DUMP."); return; }
-    if (!card.hasUid) { Serial.println("No snapshot; use READ first."); return; }
-    for (uint8_t i = 0; i < BLOCKS; ++i) showBlock(i);
-    return;
-  }
-  if (!strncmp(line, "KEY ", 4)) {
-    if (mode != Mode::Idle) { Serial.println("Use STOP before KEY."); return; }
-    char *end = nullptr;
-    unsigned long sector = strtoul(line + 4, &end, 10);
-    if (end == line + 4 || sector >= SECTORS || *end != ' ') {
-      Serial.println("Usage: KEY 0 FFFFFFFFFFFF (sector 0..15)"); return;
-    }
-    while (*end == ' ') ++end;
-    if (strlen(end) != 12) {
-      Serial.println("Key A must contain exactly 12 hex digits."); return;
-    }
-    uint8_t parsed[6];
-    for (uint8_t i = 0; i < 6; ++i) {
-      const char hi = end[2 * i], lo = end[2 * i + 1];
-      if (!isxdigit((unsigned char)hi) || !isxdigit((unsigned char)lo)) {
-        Serial.println("Key A must contain exactly 12 hex digits."); return;
-      }
-      const uint8_t h = hi <= '9' ? hi - '0' : hi - 'A' + 10;
-      const uint8_t l = lo <= '9' ? lo - '0' : lo - 'A' + 10;
-      parsed[i] = (h << 4) | l;
-    }
-    memcpy(keyA[sector], parsed, sizeof(parsed));
-    Serial.printf("Key A for sector %lu updated in RAM (not printed).\n", sector);
-    return;
-  }
-  if (!strncmp(line, "BLOCK ", 6)) {
-    if (mode != Mode::Idle) { Serial.println("Use STOP before BLOCK."); return; }
-    char *end = nullptr;
-    unsigned long index = strtoul(line + 6, &end, 10);
-    if (end != line + 6 && *end == '\0' && index < BLOCKS) {
-      showBlock((uint8_t)index);
-      return;
-    }
-    Serial.println("Usage: BLOCK 0..63");
-    return;
-  }
-  Serial.println("Unknown command. Type HELP.");
+  if (!strcmp(line, "READ")) beginRead();
+  else if (!strcmp(line, "EMU")) beginListen();
+  else if (!strcmp(line, "STOP")) { stopNfc(); Serial.println("Stopped; UID retained in RAM."); }
+  else if (!strcmp(line, "UID")) printUid();
+  else if (!strcmp(line, "STATUS")) {
+    Serial.printf("NFC=%s mode=%s\n", nfcReady ? "ready" : "init failed",
+                  mode == Mode::Read ? "READ" : mode == Mode::ListenUid ? "UID-ONLY" : "IDLE");
+    printUid();
+  } else if (!strcmp(line, "HELP")) printHelp();
+  else Serial.println("Unknown command. Send HELP.");
 }
-// One bounded command per call; CR/LF and CRLF work in Arduino Serial Monitor.
-// Returns false when a mode change interrupted the current dump.
-bool serviceSerial() {
-  const uint32_t generation = modeGeneration;
+void serviceSerial() {
   while (Serial.available()) {
     const char c = (char)Serial.read();
     if (c == '\r' || c == '\n') {
-      if (inputOverflow) Serial.println("Command too long; type HELP.");
-      else if (inputLength) { input[inputLength] = '\0'; handleCommand(input); }
-      inputLength = 0;
-      inputOverflow = false;
-    } else if (!inputOverflow) {
-      if (inputLength < sizeof(input) - 1) input[inputLength++] = c;
-      else inputOverflow = true;
+      if (commandOverflow) Serial.println("Command too long.");
+      else if (commandLength) { command[commandLength] = '\0'; handleCommand(command); }
+      commandLength = 0;
+      commandOverflow = false;
+    } else if (!commandOverflow) {
+      if (commandLength < sizeof(command) - 1) command[commandLength++] = c;
+      else commandOverflow = true;
     }
-    if (modeGeneration != generation) return false;
   }
-  return true;
 }
-
-bool acquire(const uint8_t expectedUid[4], rfalNfcDevice **out, uint32_t generation) {
-  stopPoll();
-  if (nfc.rfalNfcDiscover(&discover) != ERR_NONE) return false;
-  const uint32_t start = millis();
-  while (millis() - start < 2000) {
-    if (!serviceSerial() || modeGeneration != generation) return false;
-    nfc.rfalNfcWorker();
-    if (nfc.rfalNfcGetState() == RFAL_NFC_STATE_ACTIVATED) {
-      rfalNfcDevice *dev = nullptr;
-      if (nfc.rfalNfcGetActiveDevice(&dev) == ERR_NONE && dev && dev->nfcidLen == 4 &&
-          memcmp(dev->nfcid, expectedUid, 4) == 0) { *out = dev; return true; }
-      return false; // different card: never combine dumps
-    }
-    delay(1);
+void onCard(rfalNfcDevice *dev) {
+  if (!dev || dev->type != RFAL_NFC_POLL_TYPE_NFCA || dev->nfcidLen == 0 ||
+      dev->nfcidLen > sizeof(saved.uid)) {
+    Serial.println("Unsupported card/UID length.");
+    stopNfc();
+    return;
   }
-  return false;
-}
-
-void dumpCard(rfalNfcDevice *first) {
-  if (!first || !RfalMf1Class::isNfcaDevice(first) || first->nfcidLen != 4 ||
-      first->dev.nfca.selRes.sak != 0x08) {
-    logStatus("Not Classic 1K", "Need 4-byte UID", "and SAK 08");
-    stopPoll(); mode = Mode::Idle; return;
-  }
-  // Invalidate the old snapshot before any new attempt. A partial dump is
-  // visible on Serial but cannot silently masquerade as a complete dump.
-  memset(&card, 0, sizeof(card));
-  memcpy(card.uid, first->nfcid, 4);
-  card.atqa[0] = first->dev.nfca.sensRes.anticollisionInfo;
-  card.atqa[1] = first->dev.nfca.sensRes.platformInfo;
-  card.sak = first->dev.nfca.selRes.sak;
-  card.hasUid = true;
-  uint8_t expected[4]; memcpy(expected, card.uid, 4);
-  char uid[20]; uidText(uid, sizeof(uid));
-  Serial.printf("Classic 1K UID=%s ATQA=%02X %02X SAK=%02X\n",
-                uid, card.atqa[0], card.atqa[1], card.sak);
-  const uint32_t generation = modeGeneration;
-  dumping = true;
-  unsigned good = 0;
-  for (uint8_t sector = 0; sector < SECTORS; ++sector) {
-    if (!serviceSerial() || modeGeneration != generation) { dumping = false; return; }
-    rfalNfcDevice *dev = nullptr;
-    // MF1 sessions may be invalidated by an error/end of sector. Always
-    // reactivate before authenticating the next sector.
-    if (!acquire(expected, &dev, generation)) {
-      if (modeGeneration != generation) { dumping = false; return; }
-      Serial.printf("Sector %u: reacquire failed\n", sector);
-      break;
-    }
-    rfalMf1CryptoState crypto = {};
-    const uint8_t base = sector * 4;
-    ReturnCode rc = mf1.authenticate(&crypto, dev, base, keyA[sector], RFAL_MF1_AUTH_KEY_A);
-    if (rc != ERR_NONE) {
-      Serial.printf("Sector %u: auth failed (%d)\n", sector, (int)rc);
-      continue;
-    }
-    for (uint8_t offset = 0; offset < 4; ++offset) {
-      if (!serviceSerial() || modeGeneration != generation) { dumping = false; return; }
-      const uint8_t block = base + offset;
-      uint8_t data[BLOCK_SIZE] = {};
-      rc = mf1.readBlock(&crypto, block, data);
-      if (rc != ERR_NONE) {
-        Serial.printf("Block %u: read failed (%d)\n", block, (int)rc);
-        break;
-      }
-      memcpy(card.blocks[block], data, BLOCK_SIZE);
-      card.valid[block] = true;
-      ++good;
-      if (offset == 3) {
-        // Trailer reads do not reveal Key A (nor necessarily Key B). Mask
-        // both key regions: they are NOT a cloneable sector trailer.
-        memset(card.blocks[block], 0, 6);
-        memset(card.blocks[block] + 10, 0, 6);
-      }
-      Serial.printf("%02u%s: ", block, offset == 3 ? " trailer (keys masked)" : "");
-      for (uint8_t v : card.blocks[block]) Serial.printf("%02X", v);
-      Serial.println();
-    }
-    char progress[24]; snprintf(progress, sizeof(progress), "Sector %u/16", sector + 1);
-    char count[24]; snprintf(count, sizeof(count), "Blocks %u/64", good);
-    logStatus("READ Classic 1K", uid, progress, count);
-  }
-  stopPoll(); mode = Mode::Idle;
-  dumping = false;
-  char count[24]; snprintf(count, sizeof(count), "%u/64 blocks in RAM", good);
-  logStatus(good == BLOCKS ? "READ finished" : "PARTIAL READ", uid, count,
-         "Use BLOCK n or DUMP to inspect RAM");
-  Serial.println("RAM is volatile. Trailer keys are not recovered. UID-only listen is NOT Classic emulation.");
+  // Only replace the old snapshot when a valid ISO14443-A UID is acquired.
+  memcpy(saved.uid, dev->nfcid, dev->nfcidLen);
+  saved.length = dev->nfcidLen;
+  saved.atqa[0] = dev->dev.nfca.sensRes.anticollisionInfo;
+  saved.atqa[1] = dev->dev.nfca.sensRes.platformInfo;
+  saved.sak = dev->dev.nfca.selRes.sak;
+  saved.valid = true;
+  stopNfc();
+  Serial.println("UID saved to RAM (cleared by reset/power-off).");
+  printUid();
 }
 } // namespace
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_CS, OUTPUT); digitalWrite(PIN_CS, HIGH);
-  pinMode(PIN_IRQ, INPUT);
-  for (auto &key : keyA) memcpy(key, DEFAULT_KEY, sizeof(DEFAULT_KEY));
-  logStatus("ST25R3916 Serial test", "Type HELP for commands.");
+  // Match the working upstream SPI scanner's initialization order.
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
   spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
-  probeChip();
-  const ReturnCode initRc = nfc.rfalNfcInitialize();
-  nfcOK = (initRc == ERR_NONE);
-  Serial.printf("rfalNfcInitialize: %d%s\n", (int)initRc,
-                initRc == ERR_HW_MISMATCH ? " (ERR_HW_MISMATCH: identity is not 3916/3916B)" : "");
-  if (!nfcOK) {
-    logStatus("ST25R3916 init failed", "If IC_IDENTITY is unexpected: check SPI/power.");
-    showHelp();
-    return;
+  Serial.println("ESP32 SPI ISO14443A UID-only test");
+  Serial.printf("SCK=%d MISO=%d MOSI=%d CS=%d IRQ=%d\n",
+                PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS, PIN_IRQ);
+  const ReturnCode rc = nfc.rfalNfcInitialize();
+  Serial.printf("rfalNfcInitialize: %d\n", (int)rc);
+  nfcReady = (rc == ERR_NONE);
+  if (nfcReady) {
+    discover.compMode = RFAL_COMPLIANCE_MODE_NFC;
+    discover.devLimit = 1;
+    discover.techs2Find = RFAL_NFC_POLL_TECH_A;
+    discover.totalDuration = RFAL_ESP32_DEFAULT_DISCOVERY_DURATION_MS;
   }
-  discover.compMode = RFAL_COMPLIANCE_MODE_NFC;
-  discover.devLimit = 1;
-  discover.nfcfBR = RFAL_BR_212;
-  discover.ap2pBR = RFAL_BR_424;
-  discover.totalDuration = 1000;
-  discover.techs2Find = RFAL_NFC_POLL_TECH_A;
-  showHelp();
+  printHelp();
 }
-
 void loop() {
-  if (!serviceSerial()) return;
+  serviceSerial();
   if (mode == Mode::Read) {
     nfc.rfalNfcWorker();
     if (nfc.rfalNfcGetState() == RFAL_NFC_STATE_ACTIVATED) {
       rfalNfcDevice *dev = nullptr;
-      if (nfc.rfalNfcGetActiveDevice(&dev) == ERR_NONE) dumpCard(dev);
+      if (nfc.rfalNfcGetActiveDevice(&dev) == ERR_NONE) onCard(dev);
     }
   } else if (mode == Mode::ListenUid) {
     reader.rfalWorker();
     bool received = false;
-    const rfalLmState state = reader.rfalListenGetState(&received, nullptr);
+    reader.rfalListenGetState(&received, nullptr);
     if (received) {
-      // Do not respond to Classic AUTH/READ; this is UID-only discovery.
-      Serial.printf("Listen request: %u bits (state %u), unsupported\n", listenBits, (unsigned)state);
+      // Do not answer AUTH/READ or pretend this is a MIFARE Classic card.
       reader.rfalListenSetState(RFAL_LM_STATE_IDLE);
     }
   }
