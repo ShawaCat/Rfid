@@ -20,10 +20,11 @@ The module must be in **SPI** mode (I2C solder jumper open). No buttons or displ
 
 ## Build and test
 
-Arduino IDE: board **ESP32 Dev Module**. Install both folders `NFC-RFAL` and `ST25R3916_ELECHOUSE` from the same revision of [ELECHOUSE's ESP32 library](https://github.com/wilson-elechouse/ST25R3916) (tested library reference: `76d85da7b7e9cb89042eb0e31e070fec91030abb`). No OLED, Crypto1 or other libraries are needed. Open Serial Monitor at **115200 baud**, line ending **Newline** or **Both NL & CR** (not `No line ending`). After boot expect `rfalNfcInitialize: 0` and a command list.
+Arduino IDE: board **ESP32 Dev Module**. Install both folders `NFC-RFAL` and `ST25R3916_ELECHOUSE` from the same revision of [ELECHOUSE's ESP32 library](https://github.com/wilson-elechouse/ST25R3916) (tested library reference: `76d85da7b7e9cb89042eb0e31e070fec91030abb`). No OLED, Crypto1 or other libraries are needed. Open Serial Monitor at **115200 baud**, line ending **Newline** or **Both NL & CR** (not `No line ending`). After boot expect `ESP32 SPI ISO14443A UID-only test v2`, `rfalNfcInitialize: 0` and a command list. If initialization prints `36`, send `INIT` a few seconds after boot to retry without restarting; record both results. If the upstream `ESP32_SPI_scan_14443A_led` example works but `INIT` still fails, enable verbose Arduino compilation in both sketches and compare the selected `ST25R3916_ELECHOUSE` and `NFC-RFAL` library paths and pin lines printed at startup.
 
 | Command | Action |
 |---|---|
+| `INIT` | Retry NFC initialization after a failed startup (only while idle) |
 | `READ` | Wait for one ISO14443-A card; save its UID, ATQA and SAK to RAM and stop polling |
 | `UID` | Print saved UID/ATQA/SAK |
 | `EMU` | Start **UID-only** NFC-A listen mode; requires a saved 4- or 7-byte UID |
