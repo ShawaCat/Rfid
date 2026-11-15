@@ -1,35 +1,79 @@
-# ESP32 DevKit V1 + ST25R3916: UID-only serial test
+# ESP32 DevKit V1: ST25R3916, MIFARE Classic 1K, LittleFS и SSD1315
 
-Sketch: [`firmware/Classic1kRam/Classic1kRam.ino`](firmware/Classic1kRam/Classic1kRam.ino). The name of the sketch folder is retained for Arduino IDE compatibility; **this version reads only an ISO14443-A UID**, not MIFARE Classic blocks. It stores the UID, ATQA and SAK in RAM until reset/power-off, and can advertise them using the ST25R3916's NFC-A listen mode. **This is not MIFARE Classic emulation.** It has no Crypto1, authentication, or card memory responses. NFC readers/phones may see the UID or may not detect the incomplete target.
+Прошивка: [`firmware/Classic1kRam/Classic1kRam.ino`](firmware/Classic1kRam/Classic1kRam.ino). Она считывает блоки **своей тестовой** MIFARE Classic 1K, сохраняет текстовый дамп во встроенной flash-памяти ESP32 (LittleFS) и позволяет выбрать файл по имени для **эмуляции только UID, ATQA и SAK**. Эмуляции памяти, Crypto1 и ответа на `AUTH/READ` в режиме карты **нет**. UID, совпавший с оригиналом в NFC Tools, не означает, что работает полноценная копия карты. Физическая карта никогда не записывается.
 
-## Wiring
+На дисплее три пункта: **Read + save** (чтение и сохранение), **Emulate file** (выбор имени из LittleFS) и **PC file manager** (подсказки по Serial-командам). Файлы можно посмотреть и переименовать с компьютера через USB-Serial. **ESP32 DevKit V1 не предоставляет LittleFS как USB-накопитель**: проводник Windows не увидит файлы как диск. Их можно получить командой `CAT` через Serial.
 
-The photographed ELECHOUSE module has a **5V** power input with on-board regulation; use the ESP32's USB-powered **VIN/5V**, never a 5V signal on an ESP32 GPIO. See the [ELECHOUSE ESP32 SPI guide](https://www.elechouse.com/docs/st25r3916/). Common GND; ESP32 SPI GPIO logic is 3.3 V. Verify 5 V at the module's connector with a meter before use.
+## Подключение
 
-| Module pin | ESP32 DevKit V1 |
+Все земли общие. GPIO ESP32 работают с логикой **3,3 В**; подавать 5 В на входы ESP32 нельзя. Перед проводкой отключите питание. Контакты дисплея и кнопок задаются константами в начале скетча — поменяйте их, если у вашей платы другая разводка. **microSD-модуль больше не нужен**: не подключайте его к SPI.
+
+| ELECHOUSE ST25R3916 (SPI) | ESP32 DevKit V1 |
 |---|---|
 | SCLK/SCL | GPIO18 |
 | MISO/SDA | GPIO19 |
 | MOSI | GPIO23 |
 | CS | GPIO5 |
 | IRQ | GPIO4 |
-| 5V | USB-powered VIN/5V |
+| **5V** | **VIN/5V**, если ESP32 запитан от USB |
 | GND | GND |
 
-The module must be in **SPI** mode (I2C solder jumper open). No buttons or display are needed. The old code's pre-initialization SPI register probe and 1 MHz clock override were removed: initialization now follows the manufacturer's working `ESP32_SPI_scan_14443A_led` example and its default SPI clock.
+На показанном ранее модуле вход подписан **5V**: используется питание 5 В со встроенным стабилизатором согласно [инструкции ELECHOUSE](https://www.elechouse.com/docs/st25r3916/), а SPI-сигналы ESP32 остаются 3,3 В. Перемычка `I2C` на NFC-модуле должна быть разомкнута (режим SPI). Не путайте `VIN/5V` и `3V3` на ESP32; проверьте напряжение мультиметром прямо на модуле.
 
-## Build and test
-
-Arduino IDE: board **ESP32 Dev Module**. Install both folders `NFC-RFAL` and `ST25R3916_ELECHOUSE` from the same revision of [ELECHOUSE's ESP32 library](https://github.com/wilson-elechouse/ST25R3916) (tested library reference: `76d85da7b7e9cb89042eb0e31e070fec91030abb`). No OLED, Crypto1 or other libraries are needed. Open Serial Monitor at **115200 baud**, line ending **Newline** or **Both NL & CR** (not `No line ending`). After boot expect `ESP32 SPI ISO14443A UID-only test v2`, `rfalNfcInitialize: 0` and a command list. If initialization prints `36`, send `INIT` a few seconds after boot to retry without restarting; record both results. If the upstream `ESP32_SPI_scan_14443A_led` example works but `INIT` still fails, enable verbose Arduino compilation in both sketches and compare the selected `ST25R3916_ELECHOUSE` and `NFC-RFAL` library paths and pin lines printed at startup.
-
-| Command | Action |
+| SSD1315 128×64, I²C | ESP32 |
 |---|---|
-| `INIT` | Retry NFC initialization after a failed startup (only while idle) |
-| `READ` | Wait for one ISO14443-A card; save its UID, ATQA and SAK to RAM and stop polling |
-| `UID` | Print saved UID/ATQA/SAK |
-| `EMU` | Start **UID-only** NFC-A listen mode; requires a saved 4- or 7-byte UID |
-| `STOP` | Stop scanning/listening, retaining RAM snapshot |
-| `STATUS` | Show mode and saved UID |
-| `HELP` | Show commands |
+| SDA | GPIO21 |
+| SCL | GPIO22 |
+| VCC | 3V3 (если модуль рассчитан на 3,3 В) |
+| GND | GND |
 
-Suggested sequence: `READ`, present a card, wait for `UID saved to RAM`, then `UID`, `EMU` (check with a second reader), and `STOP`. Only 4- or 7-byte UIDs are supported in listen mode; a 10-byte UID can be read/stored but `EMU` refuses it. Reading/writing MIFARE Classic memory and actual Classic emulation are deliberately out of scope. Send us the startup output and result of `READ` if initialization still fails; redact the UID if it is sensitive.
+Адрес дисплея по умолчанию `0x3C`; если ваш модуль использует `0x3D`, измените `OLED_ADDR`. Для кнопок **предполагаются четыре независимых контакта, замыкающих GPIO на GND (active low)**. Включена внутренняя подтяжка `INPUT_PULLUP`:
+
+| Кнопка | GPIO | Действие |
+|---|---:|---|
+| UP | 32 | Предыдущий пункт / файл |
+| DOWN | 33 | Следующий пункт / файл |
+| OK | 25 | Выбрать / запустить |
+| BACK | 26 | Остановить режим / вернуться в меню |
+
+Это **настраиваемое назначение**, а не заявленная распиновка вашего дисплейного модуля: физические контакты кнопок следует проверить по его маркировке. Если они объединены в ADC-лестницу или I²C-расширитель, описанное подключение и текущий код кнопок не подходят.
+
+Дампы записываются в отдельный раздел LittleFS встроенной flash ESP32. Внешний SD-модуль и его CS/GPIO13 не используются; SPI остаётся только для NFC.
+
+## Установка
+
+В Arduino IDE выберите **ESP32 Dev Module** и **Tools → Partition Scheme → Default 4MB with SPIFFS** (или другую схему с разделом `spiffs` подходящего размера; проверьте фактический объём flash платы). LittleFS использует этот раздел, несмотря на его метку `spiffs`. В Serial Monitor установите **115200 бод** и окончание строки **Newline** (либо Both NL & CR). Установите:
+
+- `ST25R3916_ELECHOUSE` и `NFC-RFAL` **из одной ревизии** [ELECHOUSE ESP32-библиотеки](https://github.com/wilson-elechouse/ST25R3916) (ориентир: `76d85da7b7e9cb89042eb0e31e070fec91030abb`);
+- [U8g2](https://github.com/olikraus/u8g2) для драйвера SSD1315;
+- `SPI`, `Wire`, `LittleFS` — входят в Arduino-ESP32; отдельная SD-библиотека не нужна.
+
+Сначала убедитесь, что штатный пример `ESP32_SPI_scan_14443A_led` с теми же проводами видит UID. После запуска этого скетча ожидаются строки `NFC init: 0` и `LittleFS ready`. При `LittleFS mount failed` сначала проверьте схему разделов; для **нового/пустого** раздела отправьте `FORMAT CONFIRM` в Serial Monitor. **Это удалит все файлы в разделе LittleFS**; автоматически прошивка его никогда не форматирует. Команда `FSINIT` повторяет монтирование; при `NFC init` с ненулевым кодом попробуйте `INIT` после стабилизации питания. При проблемах с радиочипом не пытайтесь обходить проверку идентификатора.
+
+## Чтение и формат файла
+
+В меню нажмите **Read + save** либо отправьте `READ`. Поднесите MIFARE Classic 1K с **4-байтовым UID и SAK 08**. Прошивка повторно активирует карту перед каждым сектором, проверяет UID, аутентифицирует секторы 0–15 по **Key A `FF FF FF FF FF FF`** и читает блоки 0–63. Ключи других секторов можно изменить локально в `keyA[sector]` в скетче. Не отправляйте секретные ключи в переписке. После завершения создаётся файл `D000001.TXT`, `D000002.TXT` и т. д. Старые файлы не перезаписываются: запись идёт во временный файл, затем он проверяется и переименовывается. После сбоя питания незавершённый временный файл удалится при следующем сохранении. BACK/`STOP` прерывает чтение без автоматического сохранения.
+
+Формат — обычный UTF-8/ASCII текст: `RFID_UID_DUMP_V1`, строки `UID=`, `ATQA=`, `SAK=`, `KEYS=NOT_STORED`, далее `B00=` … `B63=`. Прочитанный блок содержит 32 шестнадцатеричных символа, непрочитанный — `--`. При частичной аутентификации файл **частичный**, а не полный дамп. Шесть байт Key A и шесть байт Key B в трейлерах маскируются нулями: обычное чтение не восстанавливает ключи. Для карты другого типа сохраняется только UID/ATQA/SAK и `--` для всех блоков. Файлы могут содержать конфиденциальные данные; не публикуйте дамп действующей карты доступа.
+
+## Эмуляция и файлы через Serial
+
+В меню **Emulate file** выберите имя стрелками и нажмите OK. Будут загружены UID/ATQA/SAK; **блоки файла не передаются читателю**. Поддерживаются UID длиной 4 или 7 байт (10-байтный UID можно сохранить, но не эмулировать в этом режиме RFAL). BACK останавливает режим. NFC Tools может увидеть идентификатор, но это не подтверждает аутентификацию MIFARE Classic.
+
+Для компьютера откройте Serial Monitor/терминал (115200, Newline). Режим меню **PC file manager** показывает подсказку; доступны те же команды независимо от экрана. Перед операциями с LittleFS остановите чтение/эмуляцию командой `STOP`:
+
+| Команда | Действие |
+|---|---|
+| `HELP` | Подсказка |
+| `STATUS`, `UID` | Состояние и выбранный UID |
+| `READ` | Считать карту и сохранить текстовый дамп |
+| `FILES` | Список `.TXT` файлов в корне LittleFS |
+| `CAT D000001.TXT` | Вывести весь файл в Serial (можно скопировать/сохранить лог на ПК) |
+| `RENAME D000001.TXT TEST.TXT` | Переименовать файл; существующий файл не заменяется |
+| `EMU TEST.TXT` | Загрузить указанный файл и включить UID-only режим |
+| `INIT` | Повторить неудачную инициализацию NFC |
+| `STOP` | Остановить NFC, не стирая выбранные данные из RAM |
+| `FSINIT` | Повторить монтирование LittleFS |
+| `FORMAT CONFIRM` | **Стереть** раздел LittleFS при ошибке монтирования (все дампы удаляются) |
+
+Поддерживаются только имена в **корне LittleFS по правилу 8.3**: 1–8 символов `A–Z`, `0–9`, `_`, `-` и расширение `.TXT`. Пути и вложенные папки запрещены. Дисплейный список ограничен первыми 40 подходящими файлами, но `FILES`, `CAT`, `RENAME` доступны по имени через Serial. Встроенная flash имеет конечный ресурс перезаписи; для редкого сохранения дампов это обычно приемлемо, но не используйте `READ` для непрерывного логирования. При полном стирании flash, смене разметки разделов либо перепрошивке с опцией **Erase All Flash** файлы могут пропасть. Перед такими действиями сохраните нужные дампы на ПК с помощью `CAT`. **Эта версия пока не проверена на физической плате пользователя**: проверьте цепи питания и GPIO перед включением.
