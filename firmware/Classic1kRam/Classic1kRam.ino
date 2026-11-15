@@ -1,10 +1,10 @@
-/* ESP32 DevKit V1: ST25R3916 Classic 1K read-only dump to microSD,
+/* ESP32 DevKit V1: ST25R3916 Classic 1K read-only dump to ESP32 LittleFS,
  * SSD1315 UI, and UID/ATQA/SAK-only NFC-A listen mode.
  * No MIFARE Classic card-memory emulation; no card writes.
  */
 #include <Arduino.h>
 #include <SPI.h>
-#include <SD.h>
+#include <LittleFS.h>
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <rfal_nfc.h>
@@ -17,7 +17,7 @@
 
 namespace {
 // Change these four pins only if your buttons are separately wired to GND.
-constexpr int NFC_CS = 5, NFC_IRQ = 4, SD_CS = 13;
+constexpr int NFC_CS = 5, NFC_IRQ = 4;
 constexpr int SCK = 18, MISO = 19, MOSI = 23;
 constexpr int SDA_PIN = 21, SCL_PIN = 22;
 constexpr int UP = 32, DOWN = 33, OK = 25, BACK = 26;
@@ -33,7 +33,7 @@ RfalNfcClass nfc(&reader);
 RfalMf1Class mf1(&reader);
 rfalNfcDiscoverParam discover = {};
 U8G2_SSD1315_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, SCL_PIN, SDA_PIN);
-bool oledReady = false, sdReady = false, nfcReady = false;
+bool oledReady = false, fsReady = false, nfcReady = false;
 
 struct Dump {
   uint8_t uid[10] = {};
@@ -161,9 +161,9 @@ const char *baseName(const char *name) {
 void listFiles(bool print = true) {
   fileCount = 0;
   unsigned totalFiles = 0;
-  if (!sdReady) { if (print) Serial.println("SD not mounted"); return; }
-  File root = SD.open("/");
-  if (!root) { if (print) Serial.println("SD root error"); return; }
+  if (!fsReady) { if (print) Serial.println("LittleFS not mounted"); return; }
+  File root = LittleFS.open("/");
+  if (!root) { if (print) Serial.println("LittleFS root error"); return; }
   File f;
   while ((f = root.openNextFile())) {
     const char *name = baseName(f.name());
@@ -179,20 +179,20 @@ void listFiles(bool print = true) {
                            totalFiles, (unsigned)MAX_FILES);
   if (fileCursor >= fileCount) fileCursor = 0;
 }
-bool mountSD() {
-  // Both devices share VSPI; keep the NFC CS high before mounting SD.
-  digitalWrite(NFC_CS, HIGH);
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
-  sdReady = SD.begin(SD_CS, spi, 4000000UL);
-  Serial.println(sdReady ? "microSD ready" : "microSD failed (check CS/power/FAT32)");
-  return sdReady;
+bool mountFS() {
+  // Never format on mount failure: an interrupted write must not erase dumps.
+  fsReady = LittleFS.begin(false);
+  if (fsReady) {
+    Serial.printf("LittleFS ready: %lu/%lu bytes used\n",
+                  (unsigned long)LittleFS.usedBytes(), (unsigned long)LittleFS.totalBytes());
+  } else Serial.println("LittleFS mount failed; check partition or send FORMAT CONFIRM (ERASES dumps)");
+  return fsReady;
 }
 bool nextName(char name[13]) {
   for (unsigned i = 1; i <= 999999; ++i) {
     snprintf(name, 13, "D%06u.TXT", i);
     char path[14]; pathFor(name, path);
-    if (!SD.exists(path)) return true;
+    if (!LittleFS.exists(path)) return true;
   }
   return false;
 }
@@ -200,12 +200,15 @@ void writeHex(File &f, const uint8_t *bytes, size_t n) {
   for (size_t i = 0; i < n; ++i) f.printf("%02X", bytes[i]);
 }
 bool saveDump() {
-  if (!sdReady || !card.hasUid) { notify("No SD or card"); return false; }
+  if (!fsReady || !card.hasUid) { notify("No flash or card"); return false; }
   char name[13];
   if (!nextName(name)) { notify("No free file name"); return false; }
   char path[14]; pathFor(name, path);
-  File f = SD.open(path, FILE_WRITE);
-  if (!f) { notify("SD write error"); return false; }
+  // Publish only a verified, closed file: power loss leaves at most a temp file.
+  constexpr const char *temp = "/.DUMP.TMP";
+  LittleFS.remove(temp); // discard an incomplete prior attempt
+  File f = LittleFS.open(temp, "w");
+  if (!f) { notify("Flash write error"); return false; }
   // Compare the exact expected byte count, including Arduino println() CRLF.
   // A mere nonzero file size could misreport a truncated dump as successful.
   size_t expected = strlen("RFID_UID_DUMP_V1") + 2;
@@ -228,7 +231,12 @@ bool saveDump() {
   f.flush();
   const bool good = f.getWriteError() == 0 && f.size() == expected;
   f.close();
-  if (!good) { SD.remove(path); notify("Incomplete SD write"); return false; }
+  if (!good) { LittleFS.remove(temp); notify("Incomplete flash write"); return false; }
+  if (LittleFS.exists(path) || !LittleFS.rename(temp, path)) {
+    LittleFS.remove(temp);
+    notify("Flash rename failed");
+    return false;
+  }
   strcpy(selectedFile, name);
   unsigned validBlocks = 0;
   for (bool valid : card.valid) if (valid) ++validBlocks;
@@ -244,9 +252,9 @@ bool readLine(File &f, String &line) {
   return line.length() <= 80;
 }
 bool loadDump(const char *name) {
-  if (!sdReady || !filenameOK(name)) return false;
+  if (!fsReady || !filenameOK(name)) return false;
   char path[14]; pathFor(name, path);
-  File f = SD.open(path, FILE_READ);
+  File f = LittleFS.open(path, FILE_READ);
   if (!f) return false;
   if (f.size() > 8192) { f.close(); return false; }
   static Dump candidate;
@@ -313,7 +321,7 @@ void beginListen() {
   draw();
 }
 void startRead() {
-  if (!nfcReady || !sdReady) { notify("Need NFC + SD"); draw(); return; }
+  if (!nfcReady || !fsReady) { notify("Need NFC + flash"); draw(); return; }
   stopNfc();
   const ReturnCode rc = nfc.rfalNfcDiscover(&discover);
   if (rc != ERR_NONE) { Serial.printf("Discover error: %d\n", (int)rc); notify("Scan failed"); draw(); return; }
@@ -364,23 +372,28 @@ void handleCommand(char *input) {
   if (mode != Mode::Idle) { Serial.println("Busy: send STOP first"); return; }
   if (!strcmp(input, "HELP")) {
     Serial.println("READ | FILES | CAT NAME.TXT | RENAME OLD.TXT NEW.TXT");
-    Serial.println("EMU NAME.TXT | UID | STATUS | SDINIT | INIT | STOP | HELP");
+    Serial.println("EMU NAME.TXT | UID | STATUS | FSINIT | FORMAT CONFIRM | INIT | STOP | HELP");
   } else if (!strcmp(input, "READ")) startRead();
   else if (!strcmp(input, "FILES")) listFiles();
   else if (!strcmp(input, "UID")) printUid();
   else if (!strcmp(input, "STATUS")) {
-    Serial.printf("NFC=%d SD=%d file=%s\n", nfcReady, sdReady, selectedFile);
+    Serial.printf("NFC=%d LittleFS=%d file=%s\n", nfcReady, fsReady, selectedFile);
     printUid();
-  } else if (!strcmp(input, "SDINIT")) mountSD();
-  else if (!strcmp(input, "INIT")) initNfc();
+  } else if (!strcmp(input, "FSINIT")) mountFS();
+  else if (!strcmp(input, "FORMAT CONFIRM")) {
+    if (fsReady) { Serial.println("LittleFS is mounted; FORMAT refused. Back up files first."); return; }
+    Serial.println("Formatting LittleFS partition: all stored dumps will be erased!");
+    if (!LittleFS.format()) { Serial.println("Format failed"); return; }
+    mountFS();
+  } else if (!strcmp(input, "INIT")) initNfc();
   else if (!strncmp(input, "EMU ", 4)) {
     if (loadDump(input + 4)) beginListen();
     else Serial.println("Invalid/missing dump");
   } else if (!strncmp(input, "CAT ", 4)) {
     const char *name = input + 4;
-    if (!sdReady || !filenameOK(name)) { Serial.println("Invalid filename/SD"); return; }
+    if (!fsReady || !filenameOK(name)) { Serial.println("Invalid filename/flash"); return; }
     char path[14]; pathFor(name, path);
-    File f = SD.open(path, FILE_READ);
+    File f = LittleFS.open(path, FILE_READ);
     if (!f) { Serial.println("No such file"); return; }
     if (f.size() > 8192) Serial.println("File too large");
     else while (f.available()) Serial.write(f.read());
@@ -389,11 +402,11 @@ void handleCommand(char *input) {
     char *old = input + 7, *space = strchr(old, ' ');
     if (!space) { Serial.println("Usage: RENAME OLD.TXT NEW.TXT"); return; }
     *space++ = '\0';
-    if (!sdReady || !filenameOK(old) || !filenameOK(space)) {
-      Serial.println("Invalid filename/SD"); return;
+    if (!fsReady || !filenameOK(old) || !filenameOK(space)) {
+      Serial.println("Invalid filename/flash"); return;
     }
     char from[14], to[14]; pathFor(old, from); pathFor(space, to);
-    if (!SD.exists(from) || SD.exists(to) || !SD.rename(from, to)) {
+    if (!LittleFS.exists(from) || LittleFS.exists(to) || !LittleFS.rename(from, to)) {
       Serial.println("Rename failed (missing source or target exists)"); return;
     }
     if (!strcmp(selectedFile, old)) strcpy(selectedFile, space);
@@ -487,7 +500,7 @@ void readCard(rfalNfcDevice *first) {
   Serial.printf("Read %u/64 blocks; incomplete sectors remain --\n", count);
   const bool saved = saveDump();
   page = Page::Result;
-  if (!saved) notify("SD save FAILED");
+  if (!saved) notify("Flash save FAILED");
   draw();
 }
 } // namespace
@@ -495,7 +508,6 @@ void readCard(rfalNfcDevice *first) {
 void setup() {
   Serial.begin(115200);
   pinMode(NFC_CS, OUTPUT); digitalWrite(NFC_CS, HIGH);
-  pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
   for (auto &key : keyA) memcpy(key, DEFAULT_KEY, 6);
   for (uint8_t pin : {UP, DOWN, OK, BACK}) pinMode(pin, INPUT_PULLUP);
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -509,7 +521,7 @@ void setup() {
   discover.devLimit = 1;
   discover.techs2Find = RFAL_NFC_POLL_TECH_A;
   discover.totalDuration = RFAL_ESP32_DEFAULT_DISCOVERY_DURATION_MS;
-  mountSD();
+  mountFS();
   notify("Ready: READ/HELP"); draw();
 }
 void loop() {
