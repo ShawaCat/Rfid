@@ -18,9 +18,10 @@
 namespace {
 // Change these four pins only if your buttons are separately wired to GND.
 constexpr int NFC_CS = 5, NFC_IRQ = 4;
-constexpr int SCK = 18, MISO = 19, MOSI = 23;
+// Use unique pin names: Arduino-ESP32 already defines SCK/MISO/MOSI and OK.
+constexpr int PIN_SPI_SCK = 18, PIN_SPI_MISO = 19, PIN_SPI_MOSI = 23;
 constexpr int SDA_PIN = 21, SCL_PIN = 22;
-constexpr int UP = 32, DOWN = 33, OK = 25, BACK = 26;
+constexpr int PIN_UP = 32, PIN_DOWN = 33, PIN_OK = 25, PIN_BACK = 26;
 constexpr uint8_t OLED_ADDR = 0x3C;
 constexpr uint8_t BLOCKS = 64, SECTORS = 16;
 constexpr uint8_t DEFAULT_KEY[6] = {255, 255, 255, 255, 255, 255};
@@ -74,7 +75,7 @@ struct Button {
     return false;
   }
 };
-Button up{UP}, down{DOWN}, ok{OK}, back{BACK};
+Button up{PIN_UP}, down{PIN_DOWN}, ok{PIN_OK}, back{PIN_BACK};
 
 void notify(const char *text) {
   snprintf(message, sizeof(message), "%s", text);
@@ -509,12 +510,12 @@ void setup() {
   Serial.begin(115200);
   pinMode(NFC_CS, OUTPUT); digitalWrite(NFC_CS, HIGH);
   for (auto &key : keyA) memcpy(key, DEFAULT_KEY, 6);
-  for (uint8_t pin : {UP, DOWN, OK, BACK}) pinMode(pin, INPUT_PULLUP);
+  for (uint8_t pin : {PIN_UP, PIN_DOWN, PIN_OK, PIN_BACK}) pinMode(pin, INPUT_PULLUP);
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.beginTransmission(OLED_ADDR);
   oledReady = Wire.endTransmission() == 0;
   if (oledReady) { oled.setI2CAddress(OLED_ADDR << 1); oled.begin(); }
-  spi.begin(SCK, MISO, MOSI, NFC_CS);
+  spi.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, NFC_CS);
   // Keep the working upstream initialization order: no register probe.
   initNfc();
   discover.compMode = RFAL_COMPLIANCE_MODE_NFC;
