@@ -22,7 +22,7 @@ constexpr int NFC_CS = 5, NFC_IRQ = 4;
 constexpr int PIN_SPI_SCK = 18, PIN_SPI_MISO = 19, PIN_SPI_MOSI = 23;
 constexpr int SDA_PIN = 21, SCL_PIN = 22;
 constexpr int PIN_UP = 32, PIN_DOWN = 33, PIN_OK = 25, PIN_BACK = 26;
-constexpr uint8_t OLED_ADDR = 0x3C;
+constexpr uint8_t OLED_ADDR_PRIMARY = 0x3C, OLED_ADDR_ALTERNATE = 0x3D;
 constexpr uint8_t BLOCKS = 64, SECTORS = 16;
 constexpr uint8_t DEFAULT_KEY[6] = {255, 255, 255, 255, 255, 255};
 constexpr uint8_t MAX_FILES = 40;
@@ -115,6 +115,36 @@ void draw() {
     oled.drawStr(0, 49, mode == Mode::Listen ? "UID ONLY - no blocks" : "BACK=menu");
   }
   oled.sendBuffer();
+}
+bool oledResponds(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+void initOled() {
+  // A failed I2C probe used to silently disable every draw call.
+  oledReady = false;
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  uint8_t address = 0;
+  if (oledResponds(OLED_ADDR_PRIMARY)) address = OLED_ADDR_PRIMARY;
+  else if (oledResponds(OLED_ADDR_ALTERNATE)) address = OLED_ADDR_ALTERNATE;
+  if (!address) {
+    Serial.printf("OLED: no response at 0x3C/0x3D (SDA=%d SCL=%d). I2C devices:",
+                  SDA_PIN, SCL_PIN);
+    bool any = false;
+    for (uint8_t candidate = 0x08; candidate <= 0x77; ++candidate) {
+      if (oledResponds(candidate)) { Serial.printf(" 0x%02X", candidate); any = true; }
+    }
+    if (!any) Serial.print(" none");
+    Serial.println();
+    return;
+  }
+  oled.setI2CAddress(address << 1); // U8g2 takes an 8-bit address
+  oled.begin();
+  oledReady = true;
+  Serial.printf("OLED: I2C 0x%02X, SSD1315 128x64 init sent (SDA=%d SCL=%d)\n",
+                address, SDA_PIN, SCL_PIN);
+  draw(); // show a screen even if NFC/flash initialization later fails
 }
 void stopNfc() {
   ++generation;
@@ -373,14 +403,15 @@ void handleCommand(char *input) {
   if (mode != Mode::Idle) { Serial.println("Busy: send STOP first"); return; }
   if (!strcmp(input, "HELP")) {
     Serial.println("READ | FILES | CAT NAME.TXT | RENAME OLD.TXT NEW.TXT");
-    Serial.println("EMU NAME.TXT | UID | STATUS | FSINIT | FORMAT CONFIRM | INIT | STOP | HELP");
+    Serial.println("EMU NAME.TXT | UID | STATUS | OLED | FSINIT | FORMAT CONFIRM | INIT | STOP | HELP");
   } else if (!strcmp(input, "READ")) startRead();
   else if (!strcmp(input, "FILES")) listFiles();
   else if (!strcmp(input, "UID")) printUid();
   else if (!strcmp(input, "STATUS")) {
     Serial.printf("NFC=%d LittleFS=%d file=%s\n", nfcReady, fsReady, selectedFile);
     printUid();
-  } else if (!strcmp(input, "FSINIT")) mountFS();
+  } else if (!strcmp(input, "OLED")) initOled();
+  else if (!strcmp(input, "FSINIT")) mountFS();
   else if (!strcmp(input, "FORMAT CONFIRM")) {
     if (fsReady) { Serial.println("LittleFS is mounted; FORMAT refused. Back up files first."); return; }
     Serial.println("Formatting LittleFS partition: all stored dumps will be erased!");
@@ -511,10 +542,7 @@ void setup() {
   pinMode(NFC_CS, OUTPUT); digitalWrite(NFC_CS, HIGH);
   for (auto &key : keyA) memcpy(key, DEFAULT_KEY, 6);
   for (uint8_t pin : {PIN_UP, PIN_DOWN, PIN_OK, PIN_BACK}) pinMode(pin, INPUT_PULLUP);
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.beginTransmission(OLED_ADDR);
-  oledReady = Wire.endTransmission() == 0;
-  if (oledReady) { oled.setI2CAddress(OLED_ADDR << 1); oled.begin(); }
+  initOled();
   spi.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, NFC_CS);
   // Keep the working upstream initialization order: no register probe.
   initNfc();
